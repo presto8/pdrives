@@ -1,0 +1,133 @@
+#!/usr/bin/env python
+
+import argparse
+import fnmatch
+import json
+import os
+import subprocess
+import sys
+from typing import NamedTuple, Optional, Generator
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--verbose', default=False, action='store_true', help='show more detailed messages')
+    return parser.parse_args()
+
+
+def main():
+    drives = []
+    for path in get_drive_paths():
+        if result := get_drive_info(path):
+            drives.append(result)
+
+    drives.sort(key=lambda x: x.hours, reverse=True)
+    print_drives(drives)
+
+
+class DriveInfo(NamedTuple):
+    name: str
+    model: str
+    serial: str
+    capacity_bytes: int
+    hours: int
+    temp_c: int
+    pending_sector_health: int
+
+
+def format_status(d: DriveInfo, alerts: str) -> str:
+    if alerts:
+        return "DEGRADED"
+    return "healthy"
+    # TODO: critical, failing
+
+
+def format_alert(d: DriveInfo) -> str:
+    result = []
+
+    if d.pending_sector_health != 100:
+        result.append("current_pending_sector")
+
+    return " ".join(result)
+
+
+def print_drives(drives: list[DriveInfo]) -> None:
+    template = "{status:<10}  {name:<10}  {years:>6}  {tb:>4}  {model:<30}  {serial:<15}  {alerts}"
+
+    header = dict(status="STATUS", name="NAME", years="YEARS", tb="TB", model="MODEL", serial="SERIAL", alerts="ALERTS")
+    print(template.format(**header))
+
+    for drive in drives:
+        d = drive._asdict()
+        d['years'] = "{:.1f}".format(drive.hours / (24 * 365.25))
+        d['tb'] = "{:.1f}".format(drive.capacity_bytes / 1000**4)
+        d['alerts'] = format_alert(drive)
+        d['status'] = format_status(drive, d['alerts'])
+        print(template.format(**d))
+
+
+def get_smart_attribute(j, attr):
+    for x in j['ata_smart_attributes']['table']:
+        if x['name'] == attr:
+            return x['value']
+    return None
+
+
+def get_drive_info(drivepath) -> Optional[DriveInfo]:
+    j = run_smartctl("-a", drivepath)
+
+    result = {}
+    result['name'] = j['device']['name']
+    result['model'] = j.get('model_name', 'unknown')
+    try:
+        result['serial'] = j['serial_number']
+    except KeyError:
+        return None
+    result['capacity_bytes'] = j['user_capacity']['bytes']
+    result['hours'] = j['power_on_time']['hours']
+    result['temp_c'] = j['temperature']['current']
+    result['pending_sector_health'] = get_smart_attribute(j, 'Current_Pending_Sector')
+
+    # parse_selftest_log(j)
+
+    return DriveInfo(**result)
+
+
+class SelftestLog(NamedTuple):
+    last_short_hours: int
+    last_extended_hours: int
+    last_short_passed: bool
+    last_extended_passed: bool
+
+
+def parse_selftest_log(j) -> SelftestLog:
+    last_pass = 0
+    table = j['ata_smart_self_test_log']['standard']['table']
+    short = [x for x in table if x['type']['value'] == 1]
+    extended = [x for x in table if x['type']['value'] == 2]
+
+
+def run_smartctl(*args):
+    result = subprocess.run(["sudo", "smartctl", "--json", *args], capture_output=True)
+    return json.loads(result.stdout)
+
+
+def get_drive_paths() -> Generator[str, None, None]:
+    for file in os.listdir('/dev'):
+        if fnmatch.fnmatch(file, 'sd?'):
+            yield '/dev/' + file
+
+
+class Fail(Exception):
+    pass
+
+
+if __name__ == '__main__':
+    try:
+        ARGS = parse_args()
+        main()
+    except Fail as f:
+        print(*f.args, file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("Ctrl+C")
